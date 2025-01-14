@@ -10,7 +10,7 @@ typedef struct {
   u32 unk_0x8;
   u32 unk_0xC;
   u32 unk_0x10;
-} __attribute__((packed, aligned(4))) me_params_t;  // Size: 0x40
+} __attribute__((packed, aligned(4))) me_params_t;  // Size: 0x14
 
 typedef struct {
   u32 unk_0x0;  // Needs to be < 0x5100602
